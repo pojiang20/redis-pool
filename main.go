@@ -61,13 +61,3 @@ func PoolInitRedis(server string, password string) *redigo.Pool {
 		},
 	}
 }
-
-func printAvailableConn(connGroup []redigo.Conn) {
-	cnt := 0
-	for _, v := range connGroup {
-		if v.Err() == nil {
-			cnt++
-		}
-	}
-	fmt.Printf("there is %d available conn\n", cnt)
-}
