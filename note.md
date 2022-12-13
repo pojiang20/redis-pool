@@ -101,7 +101,7 @@ func NewConn(netConn net.Conn) *Conn {
 	return cn
 }
 ```
-以及启动检查器，根据配置的间隔时间定期清理过期的空闲连接。这里处理过期连接逻辑如下，只有当poolSize没满，并且可以从reapStaleConn()中获取出过期连接，才会将连接移除。
+以及启动检查器，根据配置的间隔时间定期清理过期的空闲连接。这里处理过期连接逻辑如下，只有当poolSize没满（能通过getTurn），并且可以从reapStaleConn()中获取出过期连接，才会将连接移除。
 ```go
 func (p *ConnPool) ReapStaleConns() (int, error) {
 	var n int
@@ -236,7 +236,120 @@ func (p *ConnPool) waitTurn() error {
 	}
 }
 ```
-这里提一下Idle这个数据结构，这是一个双端队列，在队列尾部添加和弹出。
+### 移除连接
+就是逐个匹配连接，然后删除。
+```go
+func (p *ConnPool) removeConn(cn *Conn) {
+    // 遍历连接队列找到要关闭的连接，并将其移除出连接队列
+    for i, c := range p.conns {
+        if c == cn {
+            // 比较指针的值
+            p.conns = append(p.conns[:i], p.conns[i+1:]...)
+            if cn.pooled {
+                // 如果 cn 这个连接是在 pool 中的，更新连接池统计数据
+                p.poolSize--
+                // 检查连接池最小空闲连接数量，如果不满足最小值，需要异步补充
+                p.checkMinIdleConns()
+            }
+            return
+        }
+    }
+}
+```
+### 监控和回收过期连接
+这里启动一个reaper协程，定期检测闲置队列中的连接是否过期。注意这里是从闲置队列队头开始处理，具体分析见前文。
+```go
+//frequency 指定了多久进行一次检查，这里直接作为定时器 ticker 的触发间隔
+//无限循环判断连接是否过期，过期的连接清理掉
+func (p *ConnPool) reaper(frequency time.Duration) {
+    // 创建 ticker
+    ticker := time.NewTicker(frequency)
+    defer ticker.Stop()
+
+    for {
+        select {
+            // 循环判断计时器是否到时
+        case <-ticker.C:
+            // It is possible that ticker and closedCh arrive together,
+            // and select pseudo-randomly pick ticker case, we double
+            // check here to prevent being executed after closed.
+            if p.closed() {
+                return
+            }
+            // 移除空闲连接队列中的过期连接
+            _, err := p.ReapStaleConns()
+            if err != nil {
+                internal.Logger.Printf("ReapStaleConns failed: %s", err)
+                continue
+            }
+        case <-p.closedCh:
+            // 连接池是否关闭
+            //pool 的结束标志触发，子协程退出常用范式
+            return
+        }
+    }
+}
+
+// 移除空闲连接队列中的过期连接，无限循环判断连接是否过期
+func (p *ConnPool) ReapStaleConns() (int, error) {
+    var n int
+    for {
+        // 先获取令牌：需要向queue chan写进数据才能往下执行，否则就会阻塞，等queue有容量
+        p.getTurn()
+
+        p.connsMu.Lock()
+        cn := p.reapStaleConn()
+        p.connsMu.Unlock()
+        // 用完之后，就要从queue chan读取出放进去的数据，让queue有容量写入
+        p.freeTurn()
+
+        if cn != nil {
+            // 关闭单个连接
+            _ = p.closeConn(cn)
+            n++
+        } else {
+            break
+        }
+    }
+    atomic.AddUint32(&p.stats.StaleConns, uint32(n))
+    return n, nil
+}
+
+// 每次总idleConns的切片头部取出一个来判断是否过期,如果过期的话，更新idleConns，并且关闭过期连接
+func (p *ConnPool) reapStaleConn() *Conn {
+	if len(p.idleConns) == 0 {
+		return nil
+	}
+
+	cn := p.idleConns[0]
+	if !p.isStaleConn(cn) {
+		return nil
+	}
+
+	p.idleConns = append(p.idleConns[:0], p.idleConns[1:]...)
+	p.idleConnsLen--
+
+	return cn
+}
+```
+### 连接回收策略
+如果是失效链接则移除，否则放入池子。
+```go
+func (c *baseClient) releaseConn(cn *pool.Conn, err error) {
+	if c.limiter != nil {
+		c.limiter.ReportResult(err)
+	}
+
+	if internal.IsBadConn(err, false) {
+		c.connPool.Remove(cn, err)
+	} else {
+		c.connPool.Put(cn)
+	}
+}
+```
+
+### 闲置链接
+维护Idle的数据结构，是一个双端队列，在队列尾部添加和弹出。
 ```go
 func (p *ConnPool) popIdle() *Conn {
 	if len(p.idleConns) == 0 {
@@ -281,40 +394,11 @@ func (p *ConnPool) reapStaleConn() *Conn {
 	return cn
 }
 ```
-这样做是非常合理的，因为队尾一定是频繁put和get的连接，而队头一定是相对变动少的"久远"的连接，队头连接失效的可能性更大。
-### 放回连接
-将链接放回到闲置队列队尾
-```go
-func (p *ConnPool) Put(cn *Conn) {
-    if !cn.pooled {
-    p.Remove(cn, nil)
-    return
-    }
-    
-    p.connsMu.Lock()
-    p.idleConns = append(p.idleConns, cn)
-    p.idleConnsLen++
-    p.connsMu.Unlock()
-    p.freeTurn()
-}
-```
-### 移除连接
-就是逐个匹配连接，然后删除。
-```go
-func (p *ConnPool) removeConn(cn *Conn) {
-    // 遍历连接队列找到要关闭的连接，并将其移除出连接队列
-    for i, c := range p.conns {
-        if c == cn {
-            // 比较指针的值
-            p.conns = append(p.conns[:i], p.conns[i+1:]...)
-            if cn.pooled {
-                // 如果 cn 这个连接是在 pool 中的，更新连接池统计数据
-                p.poolSize--
-                // 检查连接池最小空闲连接数量，如果不满足最小值，需要异步补充
-                p.checkMinIdleConns()
-            }
-            return
-        }
-    }
-}
-```
+![img.png](https://raw.githubusercontent.com/pandaychen/pandaychen.github.io/master/blog_img/redis/redis-pool-lifo.png)
+这种数据结构，队尾是频繁put和get的连接，而队头是变动相对少的"久远"的连接，队头连接失效的可能性更大。
+这种后进先出的机制可能造成[问题](https://github.com/go-redis/redis/issues/1819)
+因此在v8版本引入了FIFO选项
+
+
+### 参考
+[Go-Redis 连接池（Pool）源码分析](https://pandaychen.github.io/2020/02/22/A-REDIS-POOL-ANALYSIS/)
